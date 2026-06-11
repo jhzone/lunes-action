@@ -3,8 +3,8 @@ name: Lunes Action(Sweet-Node6-US)
 on:
   workflow_dispatch:
   schedule:
-    # 每隔14天运行一次（UTC时间）
-    - cron: "0 0 */14 * *"
+    # 每隔7天运行一次（UTC时间）
+    - cron: "0 0 */7 * *"
 
 jobs:
   login:
