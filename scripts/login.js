@@ -20,8 +20,7 @@ async function notifyTelegram({ ok, stage, msg, screenshotPath }) {
     if (!token || !chatId) return;
     const text = [
       `🔔 Lunes 自动操作：${ok ? '✅ 成功' : '❌ 失败'}`,
-      `阶段：${stage}`,
-      msg ? `信息：${msg}` : '',
+      `阶段：${stage}`, msg ? `信息：${msg}` : '',
       `时间：${new Date().toISOString()}`
     ].filter(Boolean).join('\n');
     await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
@@ -77,7 +76,7 @@ async function main() {
   const page = await context.newPage();
 
   try {
-    // ═══ 1. 先访问登录页，获取 CSRF token 和初始 cookie ═══
+    // ═══ 1. 访问登录页，获取 CSRF token 和 session cookie ═══
     log('步骤1', '访问登录页获取 CSRF token...');
     await page.goto(LOGIN_URL, { waitUntil: 'networkidle', timeout: 60_000 });
     await delay(3000, 5000);
@@ -93,20 +92,21 @@ async function main() {
     }
 
     // ═══ 2. 通过 page.evaluate 发送 fetch POST 登录 ═══
+    // 重要: Playwright page.evaluate 只接受一个参数，必须包成对象
     log('步骤2', '通过 HTTP POST 登录...');
 
-    const loginResult = await page.evaluate(async (user, pass, baseUrl) => {
+    const loginResult = await page.evaluate(async (args) => {
+      const { user, pass, baseUrl } = args;
+
       // 获取 CSRF token
       const csrfMeta = document.querySelector('meta[name="csrf-token"]');
       const csrfInput = document.querySelector('input[name="_token"]');
       const csrfToken = csrfMeta?.content || csrfInput?.value || '';
 
-      // 构造 form body
       const body = new URLSearchParams();
       body.append('_token', csrfToken);
-      body.append('username', user);    // Pterodactyl 用 'username'
+      body.append('username', user);
       body.append('password', pass);
-      body.append('email', user);       // 备用: 有些用 'email'
 
       const resp = await fetch(baseUrl + '/auth/login', {
         method: 'POST',
@@ -117,22 +117,19 @@ async function main() {
           'X-CSRF-TOKEN': csrfToken,
         },
         body: body.toString(),
-        redirect: 'manual',   // 不让 fetch 自动跟随重定向
+        redirect: 'manual',
       });
 
       return {
         status: resp.status,
         location: resp.headers.get('location') || '',
-        setCookie: resp.headers.get('set-cookie') || '',
-        redirected: resp.redirected,
         url: resp.url,
       };
-    }, username, password, BASE);
+    }, { user: username, pass: password, baseUrl: BASE });
 
     log('步骤2', `登录响应: status=${loginResult.status}, location="${loginResult.location}"`);
 
-    // ═══ 3. 根据响应处理 ═══
-    // Pterodactyl 登录成功通常返回 302 → /
+    // ═══ 3. 根据响应导航 ═══
     if (loginResult.status === 302 || loginResult.status === 301 || loginResult.status === 303) {
       log('步骤3', `✅ 服务端返回重定向 → ${loginResult.location}`);
       const target = loginResult.location.startsWith('http')
@@ -141,21 +138,19 @@ async function main() {
       log('步骤3', `导航到: ${target}`);
       await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
     } else if (loginResult.status === 200) {
-      // 可能登录失败（返回登录页）
-      log('步骤3', '⚠️ POST 返回 200，尝试直接导航到 /...');
+      log('步骤3', 'POST 返回 200，导航到 /');
       await page.goto(BASE + '/', { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
     } else {
-      log('步骤3', `意外的响应码: ${loginResult.status}，尝试导航到 /`);
+      log('步骤3', `状态码 ${loginResult.status}，导航到 /`);
       await page.goto(BASE + '/', { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
     }
 
     await delay(3000, 5000);
 
-    // ═══ 4. 验证是否登录成功 ═══
+    // ═══ 4. 验证登录结果 ═══
     const url = page.url();
     const pageTitle = await page.title().catch(() => '?');
-    log('步骤4', `当前 URL: ${url}`);
-    log('步骤4', `页面标题: ${pageTitle}`);
+    log('步骤4', `URL: ${url}, 标题: ${pageTitle}`);
 
     const isOnLoginPage = /\/auth\/login/i.test(url);
     const successPatterns = [/\/dashboard/i, /\/server/i, /\/servers/i, /\/home/i, /\/admin/i, /\/console/i, /\/panel/i, /\/account/i, /\/overview/i, /\/nodes/i, /\/locations/i];
@@ -165,15 +160,12 @@ async function main() {
     try { await page.screenshot({ path: spAfter, fullPage: true }); } catch { /* ignore */ }
 
     if (isOnLoginPage && !urlSuccess) {
-      // 检查页面中是否有 "Invalid credentials" 等错误
-      let errorText = '';
-      try {
-        errorText = (await page.locator('body').innerText({ timeout: 3000 }).catch(() => '')).substring(0, 300);
-      } catch { /* ignore */ }
-      log('步骤4', `❌ 登录失败。页面内容: ${errorText}`);
+      let bodySnippet = '';
+      try { bodySnippet = (await page.locator('body').innerText({ timeout: 3000 }).catch(() => '')).substring(0, 300); } catch { /* ignore */ }
+      log('步骤4', `❌ 登录失败。页面: ${bodySnippet}`);
       await notifyTelegram({
         ok: false, stage: '登录失败',
-        msg: `HTTP status=${loginResult.status}, URL=${url}, 页面: ${errorText}`,
+        msg: `HTTP=${loginResult.status}, URL=${url}`,
         screenshotPath: spAfter
       });
       process.exitCode = 1;
