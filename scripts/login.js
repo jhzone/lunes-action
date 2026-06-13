@@ -1,18 +1,22 @@
 // scripts/login.js
-// === 反 Cloudflare 检测的 Playwright 自动登录脚本 ===
-import { chromium } from 'playwright';
+// === 使用 playwright-extra + stealth 插件绕过 Cloudflare Turnstile ===
+import { chromium } from 'playwright-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import fs from 'fs';
 import { randomInt } from 'crypto';
+
+// ═══════════════════════════════════════════════════════
+// 关键：注册 stealth 插件（深度伪造浏览器指纹，绕过 Cloudflare Turnstile）
+// ═══════════════════════════════════════════════════════
+chromium.use(StealthPlugin());
 
 const LOGIN_URL = 'https://ctrl.lunes.host/auth/login';
 
 // ─── 工具函数 ─────────────────────────────────────────
 
-/** 随机延迟 (ms)，模拟人类操作间隔 */
 const delay = (min = 300, max = 800) =>
   new Promise(r => setTimeout(r, randomInt(min, max)));
 
-/** 可选 Telemetry – 不跑飞 */
 function log(label, detail) {
   const ts = new Date().toISOString();
   console.log(`[${ts}] ${label}`, detail ?? '');
@@ -63,85 +67,26 @@ async function notifyTelegram({ ok, stage, msg, screenshotPath }) {
 
 function envOrThrow(name) {
   const v = process.env[name];
-  if (!v) throw new Error(`环境变量 ${name} 未设置`);
+  if (!v) throw new Error(`环境变量 ${name} 未设置，请在 GitHub Secrets 中配置（Settings → Secrets and variables → Actions）`);
   return v;
 }
 
-// ─── 反 Cloudflare 检测的核心配置 ──────────────────────
+// ─── 启动浏览器（playwright-extra + stealth 插件已自动注入反检测脚本） ──
 
-/**
- * 在页面加载前注入脚本，抹掉自动化痕迹
- * Cloudflare Turnstile 会检查 navigator.webdriver、chrome.runtime 等属性
- */
-const STEALTH_INIT_SCRIPT = `
-  // 隐藏 webdriver 标记（Playwright/Puppeteer 的特征）
-  Object.defineProperty(navigator, 'webdriver', { get: () => false });
-
-  // 伪造 chrome.runtime（让页面以为这是正常 Chrome）
-  window.chrome = {
-    runtime: {},
-    loadTimes: function() {},
-    csi: function() {},
-    app: {}
-  };
-
-  // 伪造权限查询（防止通过 Permissions API 检测自动化）
-  const originalQuery = window.navigator.permissions.query;
-  window.navigator.permissions.query = (parameters) =>
-    parameters.name === 'notifications'
-      ? Promise.resolve({ state: Notification.permission })
-      : originalQuery(parameters);
-
-  // 覆盖 plugins / mimeTypes 长度（headless 通常为空）
-  Object.defineProperty(navigator, 'plugins', {
-    get: () => [1, 2, 3, 4, 5]
-  });
-  Object.defineProperty(navigator, 'languages', {
-    get: () => ['en-US', 'en']
-  });
-
-  // 重写 headless 检测常用的 iframe 方式
-  const iframe = document.createElement('iframe');
-  iframe.style.display = 'none';
-  document.body.appendChild(iframe);
-  const contentWindow = iframe.contentWindow;
-  if (contentWindow) {
-    Object.defineProperty(contentWindow.navigator, 'webdriver', { get: () => false });
-  }
-`;
-
-/** 启动反检测浏览器 */
-async function launchAntiDetectionBrowser() {
+async function launchBrowser() {
   const browser = await chromium.launch({
     headless: true,
     args: [
-      // ── 基础 ──
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
-
-      // ── 反检测参数 ──
       '--disable-blink-features=AutomationControlled',
-      '--disable-features=IsolateOrigins,site-per-process',
-      '--disable-site-isolation-trials',
-
-      // 隐藏 headless 信号
       '--window-size=1920,1080',
       '--start-maximized',
-
-      // 模拟真实 GPU
       '--use-gl=swiftshader',
       '--enable-webgl',
-
-      // 通用 UA 伪装（JS 层面还会覆盖）
-      '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-
-      // 减少 "Chrome is being controlled by automated software" 信息栏
       '--disable-infobars',
       '--disable-extensions',
-      '--disable-component-extensions-with-background-pages',
-
-      // 语言/地区
       '--lang=en-US,en',
       '--accept-lang=en-US,en;q=0.9',
     ]
@@ -149,20 +94,15 @@ async function launchAntiDetectionBrowser() {
   return browser;
 }
 
-/** 创建带反检测的新上下文 */
-async function createAntiDetectionContext(browser) {
+async function createContext(browser) {
   const context = await browser.newContext({
     viewport: { width: 1366, height: 768 },
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
     locale: 'en-US',
     timezoneId: 'Asia/Shanghai',
     permissions: ['geolocation'],
-    geolocation: { latitude: 31.2304, longitude: 121.4737 },  // 上海
+    geolocation: { latitude: 31.2304, longitude: 121.4737 },
   });
-
-  // 每个新页面都会注入反检测脚本
-  await context.addInitScript(STEALTH_INIT_SCRIPT);
-
   return context;
 }
 
@@ -174,8 +114,8 @@ async function main() {
 
   const screenshot = (name) => `./${name}.png`;
 
-  const browser = await launchAntiDetectionBrowser();
-  const context = await createAntiDetectionContext(browser);
+  const browser = await launchBrowser();
+  const context = await createContext(browser);
   const page = await context.newPage();
 
   try {
@@ -186,23 +126,24 @@ async function main() {
       timeout: 60_000
     });
 
-    // 等待页面充分渲染（Cloudflare Turnstile 可能在 document 就绪后动态加载）
-    await delay(2000, 4000);
+    // 给 Cloudflare Turnstile 足够时间完成自动验证
+    log('步骤1', '等待页面加载 & Cloudflare 自动验证...');
+    await delay(5000, 8000);
     log('步骤1', `当前 URL: ${page.url()}`);
 
-    // ═══ 步骤 2：检测 Cloudflare 人机验证 ═══
+    // ═══ 步骤 2：检测是否被 Cloudflare 拦截 ═══
     log('步骤2', '检查是否存在 Cloudflare 验证...');
     const cfSelectors = [
       'text=/Verify you are human/i',
       'text=/需要验证/i',
       'text=/安全检查/i',
       'text=/review the security/i',
-      'text=/Just a moment/i',                    // Cloudflare Waiting Room
+      'text=/Just a moment/i',
       'text=/Checking your browser/i',
-      '#challenge-stage',                         // Cloudflare Turnstile
+      '#challenge-stage',
       'iframe[src*="challenges.cloudflare.com"]',
       'iframe[src*="turnstile"]',
-      'div[class*="cf-"]',                        // Cloudflare wrapper
+      'div[class*="cf-"]',
     ];
 
     let cfDetected = false;
@@ -219,7 +160,6 @@ async function main() {
       } catch { /* selector may not match */ }
     }
 
-    // 也可通过页面标题 + URL 辅助判断
     const title = await page.title().catch(() => '');
     if (/Just a moment|Attention Required/i.test(title)) {
       cfDetected = true;
@@ -229,7 +169,7 @@ async function main() {
     if (cfDetected) {
       log('步骤2', `❌ 检测到 Cloudflare 验证！原因: ${cfReason}`);
       const sp = screenshot('01-cloudflare-block');
-      await page.screenshot({ path: sp, fullPage: true });
+      try { await page.screenshot({ path: sp, fullPage: true }); } catch (e) { log('截图失败', e.message); }
       await notifyTelegram({
         ok: false,
         stage: 'Cloudflare拦截',
@@ -243,17 +183,16 @@ async function main() {
 
     // ═══ 步骤 3：输入用户名密码 ═══
     log('步骤3', '等待登录表单...');
-    const userInput = page.locator('input[name="username"]');
-    const passInput = page.locator('input[name="password"]');
+    const userInput = page.locator('input[name="username"], input[type="email"], input#username, input#email').first();
+    const passInput = page.locator('input[name="password"], input[type="password"], input#password').first();
 
     await userInput.waitFor({ state: 'visible', timeout: 30_000 });
     await passInput.waitFor({ state: 'visible', timeout: 30_000 });
 
-    // 模拟人类逐字符输入（反检测关键！）
+    // 模拟人类逐字符输入
     await userInput.click();
     await delay(200, 500);
 
-    // 逐个字符输入用户名
     for (const ch of username) {
       await userInput.press(ch, { delay: randomInt(50, 150) });
     }
@@ -269,67 +208,110 @@ async function main() {
 
     log('步骤3', '用户名和密码已输入');
 
-    // ═══ 步骤 4：点击登录 ═══
-    const loginBtn = page.locator('button[type="submit"]');
+    // ═══ 步骤 4：截图 + 点击登录 ═══
+    const loginBtn = page.locator('button[type="submit"], button:has-text("Login"), button:has-text("登录"), button:has-text("Sign in"), input[type="submit"]').first();
     await loginBtn.waitFor({ state: 'visible', timeout: 15_000 });
 
     const spBefore = screenshot('02-before-submit');
-    await page.screenshot({ path: spBefore, fullPage: true });
+    try { await page.screenshot({ path: spBefore, fullPage: true }); } catch (e) { log('截图失败', e.message); }
 
-    // 等待一小段随机时间（模拟人类阅读页面）
     await delay(800, 2000);
 
-    await loginBtn.click({ timeout: 10_000 });
-    log('步骤4', '已点击登录按钮');
-
-    // 等待网络空闲或超时
+    // 点击登录并等待 URL 跳转
+    log('步骤4', '点击登录按钮并等待跳转...');
+    let navigatedAway = false;
     try {
-      await page.waitForLoadState('networkidle', { timeout: 30_000 });
-    } catch {
-      log('步骤4', 'networkidle 超时，继续执行');
+      await Promise.all([
+        page.waitForURL(url => !url.toString().includes('/auth/login'), { timeout: 30_000 }),
+        loginBtn.click({ timeout: 10_000 })
+      ]);
+      navigatedAway = true;
+      log('步骤4', '✅ 页面已离开登录页');
+    } catch (e) {
+      log('步骤4', `URL 跳转等待超时: ${e.message}`);
     }
 
-    await delay(2000, 4000);
+    // 等待可能的 Cloudflare Turnstile 二次验证完成
+    await delay(5000, 8000);
+
+    // 检查点击后是否弹出 Turnstile
+    const postClickTitle = await page.title().catch(() => '');
+    if (/Just a moment|Attention Required|challenge/i.test(postClickTitle)) {
+      log('步骤4', '❌ 提交后触发 Cloudflare Turnstile！尝试等待自动通过...');
+      // 给 stealth 插件更多时间自动处理 Turnstile
+      await delay(10000, 15000);
+      const title2 = await page.title().catch(() => '');
+      if (/Just a moment|Attention Required|challenge/i.test(title2)) {
+        log('步骤4', '❌ Turnstile 仍未通过');
+        const sp = screenshot('04-cf-after-submit');
+        try { await page.screenshot({ path: sp, fullPage: true }); } catch (e) { log('截图失败', e.message); }
+        await notifyTelegram({
+          ok: false,
+          stage: 'Cloudflare拦截(登录后)',
+          msg: `提交后 Turnstile 验证未通过，页面标题: "${title2}"`,
+          screenshotPath: sp
+        });
+        process.exitCode = 2;
+        return;
+      }
+      log('步骤4', '✅ Turnstile 已自动通过');
+    }
 
     // ═══ 步骤 5：验证登录结果 ═══
     const spAfter = screenshot('03-after-submit');
-    await page.screenshot({ path: spAfter, fullPage: true });
+    try { await page.screenshot({ path: spAfter, fullPage: true }); } catch (e) { log('步骤5截图失败', e.message); }
 
     const url = page.url();
+    log('步骤5', `当前 URL: ${url}`);
+    log('步骤5', `页面标题: ${await page.title().catch(() => 'unknown')}`);
+
     const isOnLoginPage = /\/auth\/login/i.test(url);
-    const successElements = [
-      'text=/Dashboard/i',
-      'text=/Logout/i',
-      'text=/Sign out/i',
-      'text=/控制台/i',
-      'text=/面板/i',
-      'text=/Servers/i',
-      'text=/server/i',
+
+    const successUrlPatterns = [
+      /\/dashboard/i, /\/server/i, /\/servers/i, /\/home/i,
+      /\/admin/i, /\/console/i, /\/panel/i, /\/account/i, /\/overview/i,
+    ];
+    const urlIndicatesSuccess = successUrlPatterns.some(p => p.test(url));
+
+    const successTextSelectors = [
+      'text=/Dashboard/i', 'text=/Logout/i', 'text=/Sign out/i',
+      'text=/控制台/i', 'text=/面板/i', 'text=/Servers/i',
+      'text=/server/i', 'text=/Overview/i', 'text=/Welcome/i', 'text=/Account/i',
     ];
 
     let successCount = 0;
-    for (const sel of successElements) {
+    const matchedText = [];
+    for (const sel of successTextSelectors) {
       try {
         const count = await page.locator(sel).first().count({ timeout: 2000 });
-        if (count > 0) successCount++;
+        if (count > 0) { successCount++; matchedText.push(sel); }
       } catch { /* ignore */ }
     }
+    log('步骤5', `匹配成功标识: ${successCount} 个 → ${matchedText.join(', ') || '无'}`);
 
-    const loginSuccess = !isOnLoginPage || successCount > 0;
+    const loginSuccess = urlIndicatesSuccess || (!isOnLoginPage && navigatedAway) || successCount >= 1;
 
     if (!loginSuccess) {
-      // 登录失败处理
-      const errorMsgNode = page.locator('text=/Invalid|incorrect|错误|失败|无效/i');
-      const hasError = await errorMsgNode.count();
-      const errorMsg = hasError
-        ? await errorMsgNode.first().innerText().catch(() => '') : '';
+      let errorMsg = '';
+      const errorMsgNode = page.locator('text=/Invalid|incorrect|错误|失败|无效|wrong|not found/i');
+      try {
+        const hasError = await errorMsgNode.count();
+        if (hasError > 0) errorMsg = await errorMsgNode.first().innerText().catch(() => '');
+      } catch { /* ignore */ }
+
+      let bodyText = '';
+      try {
+        bodyText = (await page.locator('body').innerText({ timeout: 3000 }).catch(() => '')).substring(0, 500);
+      } catch { /* ignore */ }
+
+      log('步骤5', `❌ 登录判定失败，页面片段: ${bodyText}`);
 
       await notifyTelegram({
         ok: false,
         stage: '登录失败',
         msg: errorMsg
-          ? `疑似失败（${errorMsg.trim()}）`
-          : `仍在登录页，当前 URL: ${url}`,
+          ? `疑似失败（${errorMsg.trim()}）URL: ${url}`
+          : `未匹配成功标识。URL: ${url}，匹配: ${matchedText.join(', ') || '无'}`,
         screenshotPath: spAfter
       });
       process.exitCode = 1;
@@ -338,7 +320,6 @@ async function main() {
 
     log('步骤5', `✅ 登录成功！当前 URL: ${url}`);
 
-    // ═══ 步骤 6：通知登录成功 + 后续操作 ═══
     await notifyTelegram({
       ok: true,
       stage: '登录成功',
@@ -363,7 +344,7 @@ async function main() {
     await delay(1000, 2000);
 
     const spServer = screenshot('04-server-page');
-    await page.screenshot({ path: spServer, fullPage: true });
+    try { await page.screenshot({ path: spServer, fullPage: true }); } catch (e) { log('截图失败', e.message); }
     await notifyTelegram({
       ok: true,
       stage: '进入服务器页面',
@@ -381,7 +362,6 @@ async function main() {
       await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
     } catch {
       log('步骤7', '⚠️ 未找到 Console 菜单，尝试其他选择器...');
-      // 尝试其他可能的 Console 按钮
       const altConsole = page.locator('button:has-text("Console"), a:has-text("Console"), [data-testid="console"]').first();
       if (await altConsole.count({ timeout: 3000 })) {
         await altConsole.click();
@@ -410,11 +390,10 @@ async function main() {
       await notifyTelegram({
         ok: true,
         stage: 'Restart 未找到',
-        msg: '页面中未发现 Restart 按钮，可能服务器已重启或界面不同'
+        msg: '页面中未发现 Restart 按钮'
       });
     }
 
-    // 等待 VPS 重启
     await delay(8000, 12000);
 
     // ── 输入命令 ──
@@ -433,7 +412,7 @@ async function main() {
     await delay(4000, 6000);
 
     const spCommand = screenshot('05-command-executed');
-    await page.screenshot({ path: spCommand, fullPage: true });
+    try { await page.screenshot({ path: spCommand, fullPage: true }); } catch (e) { log('截图失败', e.message); }
     await notifyTelegram({
       ok: true,
       stage: '命令执行完成',
