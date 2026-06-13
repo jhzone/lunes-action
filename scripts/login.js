@@ -1,5 +1,5 @@
 // scripts/login.js
-// === 使用 playwright-extra + stealth 插件 + Turnstile 交互策略 ===
+// === playwright-extra + stealth + Turnstile 等待策略 ===
 import { chromium } from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import fs from 'fs';
@@ -29,7 +29,6 @@ async function notifyTelegram({ ok, stage, msg, screenshotPath }) {
       console.log('[WARN] TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 未设置，跳过通知');
       return;
     }
-
     const text = [
       `🔔 Lunes 自动操作：${ok ? '✅ 成功' : '❌ 失败'}`,
       `阶段：${stage}`,
@@ -40,11 +39,7 @@ async function notifyTelegram({ ok, stage, msg, screenshotPath }) {
     await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text,
-        disable_web_page_preview: true
-      })
+      body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true })
     });
 
     if (screenshotPath && fs.existsSync(screenshotPath)) {
@@ -64,35 +59,28 @@ async function notifyTelegram({ ok, stage, msg, screenshotPath }) {
 
 function envOrThrow(name) {
   const v = process.env[name];
-  if (!v) throw new Error(`环境变量 ${name} 未设置，请在 GitHub Secrets 中配置（Settings → Secrets and variables → Actions）`);
+  if (!v) throw new Error(`环境变量 ${name} 未设置，请在 GitHub Secrets 中配置`);
   return v;
 }
 
-// ─── 启动浏览器 ───────────────────────────────────────
+// ─── 浏览器 ────────────────────────────────────────────
 
 async function launchBrowser() {
-  const browser = await chromium.launch({
+  return chromium.launch({
     headless: true,
     args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
+      '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
       '--disable-blink-features=AutomationControlled',
-      '--window-size=1920,1080',
-      '--start-maximized',
-      '--use-gl=swiftshader',
-      '--enable-webgl',
-      '--disable-infobars',
-      '--disable-extensions',
-      '--lang=en-US,en',
-      '--accept-lang=en-US,en;q=0.9',
+      '--window-size=1920,1080', '--start-maximized',
+      '--use-gl=swiftshader', '--enable-webgl',
+      '--disable-infobars', '--disable-extensions',
+      '--lang=en-US,en', '--accept-lang=en-US,en;q=0.9',
     ]
   });
-  return browser;
 }
 
 async function createContext(browser) {
-  const context = await browser.newContext({
+  return browser.newContext({
     viewport: { width: 1366, height: 768 },
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
     locale: 'en-US',
@@ -100,95 +88,96 @@ async function createContext(browser) {
     permissions: ['geolocation'],
     geolocation: { latitude: 31.2304, longitude: 121.4737 },
   });
-  return context;
 }
 
-// ─── Turnstile 检测与交互 ─────────────────────────────
+// ─── Turnstile 等待 — 核心！ ──────────────────────────
 
-/** 检测页面中是否存在 Turnstile widget，返回详细信息 */
-async function detectTurnstile(page) {
-  const info = { found: false, type: '', detail: '' };
+/**
+ * 等待 Turnstile 验证完成（token 可用 + 按钮 enabled）
+ * 返回 { passed, token, duration }
+ */
+async function waitForTurnstile(page, timeoutMs = 30000) {
+  const startTime = Date.now();
+  log('Turnstile', '等待 Turnstile 自动验证完成...');
 
-  // 检查 iframe（Cloudflare Turnstile 使用 iframe 嵌入）
-  const turnstileIframe = page.locator('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]');
-  const iframeCount = await turnstileIframe.count().catch(() => 0);
-  if (iframeCount > 0) {
-    info.found = true;
-    info.type = 'iframe';
-    info.detail = `找到 ${iframeCount} 个 Turnstile iframe`;
-    return info;
-  }
-
-  // 检查 cf-turnstile div（Turnstile 的容器）
-  const cfTurnstile = page.locator('.cf-turnstile, [data-sitekey], div[id^="cf-chl"], div[id^="cf-turnstile"]');
-  const divCount = await cfTurnstile.count().catch(() => 0);
-  if (divCount > 0) {
-    info.found = true;
-    info.type = 'div';
-    info.detail = `找到 ${divCount} 个 cf-turnstile 容器`;
-    return info;
-  }
-
-  // 通过 page.evaluate 检查 window.turnstile 对象
+  // 方法A: 轮询 window.turnstile.getResponse() 获取 token
   try {
-    const hasTurnstileObj = await page.evaluate(() => {
-      return typeof window.turnstile !== 'undefined';
-    });
-    if (hasTurnstileObj) {
-      info.found = true;
-      info.type = 'api';
-      info.detail = '检测到 window.turnstile API';
-      return info;
+    const token = await page.waitForFunction(() => {
+      if (typeof window.turnstile === 'undefined') return false;
+      try {
+        const t = window.turnstile.getResponse?.();
+        return t && t.length > 0 ? t : false;
+      } catch { return false; }
+    }, { timeout: timeoutMs, polling: 1000 }).catch(() => null);
+
+    if (token) {
+      const elapsed = Date.now() - startTime;
+      log('Turnstile', `✅ Token 已获取 (${elapsed}ms): ${(await token.jsonValue()).substring(0, 20)}...`);
+      return { passed: true, token: await token.jsonValue(), duration: elapsed };
+    }
+  } catch { /* 继续尝试其他方法 */ }
+
+  // 方法B: 等待 cf-turnstile-response hidden input 有值
+  try {
+    const hasValue = await page.waitForFunction(() => {
+      const input = document.querySelector('[name="cf-turnstile-response"], input[name*="turnstile"]');
+      return input && input.value && input.value.length > 0;
+    }, { timeout: 10000, polling: 500 }).catch(() => null);
+
+    if (hasValue) {
+      const elapsed = Date.now() - startTime;
+      log('Turnstile', `✅ Hidden input 有值 (${elapsed}ms)`);
+      return { passed: true, token: 'hidden-input', duration: elapsed };
     }
   } catch { /* ignore */ }
 
-  return info;
+  // 方法C: 等待按钮从 disabled 变为 enabled（最可靠）
+  log('Turnstile', 'Token 未获取到，等待按钮变为可点击...');
+  try {
+    await page.waitForFunction(() => {
+      const btns = document.querySelectorAll('button[type="submit"], button:has-text("Login"), button:has-text("登录")');
+      for (const b of btns) {
+        if (!b.disabled && b.offsetParent !== null) return true;
+      }
+      return false;
+    }, { timeout: Math.max(timeoutMs - (Date.now() - startTime), 5000), polling: 500 });
+
+    const elapsed = Date.now() - startTime;
+    log('Turnstile', `✅ 按钮已变为 enabled (${elapsed}ms)`);
+    return { passed: true, token: null, duration: elapsed };
+  } catch (e) {
+    log('Turnstile', `⚠️ 按钮仍未 enabled: ${e.message}`);
+  }
+
+  const elapsed = Date.now() - startTime;
+  log('Turnstile', `❌ 等待超时 (${elapsed}ms)`);
+  return { passed: false, token: null, duration: elapsed };
 }
 
-/** 尝试与 Turnstile 交互（点击 iframe 触发验证）*/
-async function interactWithTurnstile(page) {
-  log('Turnstile', '尝试与 Turnstile 交互...');
-
-  // 尝试点击 Turnstile iframe 内的 checkbox
-  const iframe = page.locator('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]').first();
-  const iframeCount = await iframe.count().catch(() => 0);
-
-  if (iframeCount > 0) {
-    try {
-      // 切换到 iframe 内部点击 checkbox
-      const frame = page.frameLocator('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]').first();
-      const checkbox = frame.locator('#checkbox, .checkbox, [role="checkbox"], input[type="checkbox"]').first();
-      if (await checkbox.count({ timeout: 3000 }).catch(() => 0) > 0) {
-        await checkbox.click({ timeout: 5000 }).catch(() => {});
-        log('Turnstile', '已点击 Turnstile checkbox');
-        return true;
+/**
+ * 检查提交按钮状态（用于诊断）
+ */
+async function checkButtonState(page) {
+  try {
+    const info = await page.evaluate(() => {
+      const btns = document.querySelectorAll('button[type="submit"]');
+      const results = [];
+      for (const b of btns) {
+        results.push({
+          text: b.innerText?.trim() || b.textContent?.trim() || '',
+          disabled: b.disabled,
+          visible: b.offsetParent !== null,
+          className: b.className,
+        });
       }
-
-      // 如果找不到 checkbox，尝试点击 body 激活
-      const body = frame.locator('body').first();
-      if (await body.count({ timeout: 3000 }).catch(() => 0) > 0) {
-        await body.click({ timeout: 5000 }).catch(() => {});
-        log('Turnstile', '已点击 Turnstile iframe body');
-        return true;
-      }
-    } catch (e) {
-      log('Turnstile', `iframe 交互失败: ${e.message}`);
-    }
+      return { buttons: results, hasTurnstile: typeof window.turnstile !== 'undefined' };
+    });
+    log('按钮状态', JSON.stringify(info));
+    return info;
+  } catch (e) {
+    log('按钮状态检查失败', e.message);
+    return null;
   }
-
-  // 尝试直接点击页面上的 cf-turnstile 容器
-  const cfDiv = page.locator('.cf-turnstile').first();
-  if (await cfDiv.count({ timeout: 2000 }).catch(() => 0) > 0) {
-    try {
-      await cfDiv.click({ timeout: 5000 }).catch(() => {});
-      log('Turnstile', '已点击 .cf-turnstile 容器');
-      return true;
-    } catch (e) {
-      log('Turnstile', `cf-turnstile 点击失败: ${e.message}`);
-    }
-  }
-
-  return false;
 }
 
 // ─── 主流程 ───────────────────────────────────────────
@@ -196,84 +185,51 @@ async function interactWithTurnstile(page) {
 async function main() {
   const username = envOrThrow('LUNES_USERNAME');
   const password = envOrThrow('LUNES_PASSWORD');
-
   const screenshot = (name) => `./${name}.png`;
 
   const browser = await launchBrowser();
   const context = await createContext(browser);
   const page = await context.newPage();
 
-  // 监听网络请求，捕获登录 API 响应
-  const loginResponses = [];
-  page.on('response', (resp) => {
-    const url = resp.url();
-    if (/auth\/login|sessions|authenticate|signin/i.test(url) && resp.status() >= 200 && resp.status() < 500) {
-      loginResponses.push({ url, status: resp.status(), ok: resp.ok() });
-      log('网络', `登录相关响应: ${resp.status()} ${url}`);
-    }
-  });
-
   try {
-    // ═══ 步骤 1：打开登录页 + 等待 Turnstile ═══
-    log('步骤1', '正在打开登录页面...');
-    await page.goto(LOGIN_URL, {
-      waitUntil: 'domcontentloaded',
-      timeout: 60_000
-    });
+    // ═══ 步骤 1：打开登录页 ═══
+    log('步骤1', '打开登录页面...');
+    await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
 
-    // 等待 Turnstile 自动验证完成
-    log('步骤1', '等待页面加载 & Turnstile 自动验证...');
+    // 等待页面充分加载 — 包括 Turnstile 脚本初始化和自动非交互式验证
+    log('步骤1', '等待页面加载 & Turnstile 初始化...');
     await delay(5000, 8000);
-
-    // 检测 Turnstile
-    const tsInfo = await detectTurnstile(page);
-    log('步骤1', `Turnstile 检测: ${tsInfo.detail || '未检测到'}`);
-
-    if (tsInfo.found) {
-      log('步骤1', '发现 Turnstile，尝试交互...');
-      await interactWithTurnstile(page);
-      // 给 Turnstile 时间完成验证
-      await delay(8000, 12000);
-
-      // 再次检测是否已通过
-      const tsInfo2 = await detectTurnstile(page);
-      log('步骤1', `交互后 Turnstile 状态: ${tsInfo2.detail || '未检测到（可能已通过）'}`);
-    }
-
     log('步骤1', `当前 URL: ${page.url()}`);
 
-    // ═══ 步骤 2：检测 Cloudflare 全页拦截 ═══
-    const title = await page.title().catch(() => '');
-    if (/Just a moment|Attention Required/i.test(title)) {
-      log('步骤2', '❌ 全页 Cloudflare 拦截，尝试等待...');
+    // 检查全页拦截
+    const title1 = await page.title().catch(() => '');
+    if (/Just a moment|Attention Required/i.test(title1)) {
+      log('步骤1', '❌ Cloudflare 全页拦截');
       await delay(15000, 20000);
-      const title2 = await page.title().catch(() => '');
-      if (/Just a moment|Attention Required/i.test(title2)) {
-        const sp = screenshot('01-cloudflare-block');
-        try { await page.screenshot({ path: sp, fullPage: true }); } catch { /* ignore */ }
-        await notifyTelegram({
-          ok: false, stage: 'Cloudflare拦截',
-          msg: `全页拦截: "${title2}"`, screenshotPath: sp
-        });
+      if (/Just a moment|Attention Required/i.test(await page.title().catch(() => ''))) {
+        await notifyTelegram({ ok: false, stage: 'Cloudflare拦截', msg: '全页拦截未解除' });
         process.exitCode = 2;
         return;
       }
     }
-    log('步骤2', '✅ 页面可正常访问');
+    log('步骤1', '✅ 页面正常');
+
+    // ═══ 步骤 2：第一次 Turnstile 等待 — 页面加载后 ═══
+    await checkButtonState(page);
+    const tsResult1 = await waitForTurnstile(page, 20000);
+    log('步骤2', `Turnstile 初次等待: ${tsResult1.passed ? '通过' : '未通过'}`);
 
     // ═══ 步骤 3：输入用户名密码 ═══
     log('步骤3', '等待登录表单...');
-    const userInput = page.locator('input[name="username"], input[type="email"], input#username, input#email').first();
+    const userInput = page.locator('input[name="username"], input[type="email"], input#username').first();
     const passInput = page.locator('input[name="password"], input[type="password"], input#password').first();
-
     await userInput.waitFor({ state: 'visible', timeout: 30_000 });
     await passInput.waitFor({ state: 'visible', timeout: 30_000 });
 
-    // 先清空输入框（可能有预填值）
+    // 清空 + 逐字符输入
     await userInput.click();
     await userInput.fill('');
     await delay(200, 500);
-
     for (const ch of username) {
       await userInput.press(ch, { delay: randomInt(50, 150) });
     }
@@ -282,243 +238,212 @@ async function main() {
     await passInput.click();
     await passInput.fill('');
     await delay(200, 500);
-
     for (const ch of password) {
       await passInput.press(ch, { delay: randomInt(50, 150) });
     }
     await delay(300, 700);
-
     log('步骤3', '用户名和密码已输入');
 
-    // ═══ 步骤 4：再次检测 Turnstile + 截图 + 多种方式提交 ═══
-    // 输入完成后，Turnstile widget 可能已激活
-    const tsInfo3 = await detectTurnstile(page);
-    log('步骤4', `输入后 Turnstile: ${tsInfo3.detail || '未检测到'}`);
+    // ═══ 步骤 4：等待 Turnstile 完成 + 按钮变为 enabled ═══
+    log('步骤4', '等待 Turnstile 自动验证 & 按钮解锁...');
 
-    if (tsInfo3.found) {
-      log('步骤4', '尝试点击 Turnstile 完成验证...');
-      await interactWithTurnstile(page);
-      await delay(5000, 10000);
+    // 输入文字后 Turnstile 可能重新评估，再等一次
+    await checkButtonState(page);
+    const tsResult2 = await waitForTurnstile(page, 30000);
+
+    if (!tsResult2.passed) {
+      // Turnstile 未通过 — 截图诊断
+      const sp = screenshot('04-button-disabled');
+      try { await page.screenshot({ path: sp, fullPage: true }); } catch { /* ignore */ }
+      await checkButtonState(page);
+      log('步骤4', '❌ Turnstile 验证未通过，按钮仍 disabled');
+      await notifyTelegram({
+        ok: false, stage: 'Turnstile未通过',
+        msg: '按钮仍被禁用，Turnstile 验证可能被 headless 模式阻拦',
+        screenshotPath: sp
+      });
+      process.exitCode = 2;
+      return;
     }
 
+    log('步骤4', '✅ Turnstile 已通过，按钮已解锁');
+
+    // 截图表单
     const spBefore = screenshot('02-before-submit');
-    try { await page.screenshot({ path: spBefore, fullPage: true }); } catch (e) { log('截图失败', e.message); }
+    try { await page.screenshot({ path: spBefore, fullPage: true }); } catch { /* ignore */ }
 
-    // 方法1：先尝试 Enter 键提交（从密码框按 Enter）
-    log('步骤4', '方法1: 在密码框中按 Enter 提交...');
-    await passInput.click();
-    await delay(300, 600);
+    // ═══ 步骤 5：点击登录 ═══
+    log('步骤5', '点击登录按钮...');
+    const loginBtn = page.locator('button[type="submit"]:not([disabled])').first();
 
-    let navigatedAway = false;
     try {
-      await Promise.all([
-        page.waitForURL(url => !url.toString().includes('/auth/login'), { timeout: 15_000 }),
-        passInput.press('Enter')
-      ]);
-      navigatedAway = true;
-      log('步骤4', '✅ Enter 提交成功，页面已跳转');
-    } catch (e) {
-      log('步骤4', `Enter 提交未跳转: ${e.message}`);
+      await loginBtn.waitFor({ state: 'visible', timeout: 10_000 });
+    } catch {
+      // fallback: 使用更宽泛的选择器
+      log('步骤5', '主选择器未找到 enabled 按钮，尝试备用选择器...');
     }
 
-    // 方法2：如果 Enter 没跳转，尝试点击按钮
-    if (!navigatedAway) {
-      log('步骤4', '方法2: 点击登录按钮...');
-      const loginBtn = page.locator('button[type="submit"], button:has-text("Login"), button:has-text("登录"), button:has-text("Sign in"), input[type="submit"]').first();
+    let loginClicked = false;
+    // 使用更稳健的点击方式
+    const allBtns = [
+      page.locator('button[type="submit"]:not([disabled])').first(),
+      page.locator('button:has-text("LOGIN"):not([disabled])').first(),
+      page.locator('button:has-text("Login"):not([disabled])').first(),
+    ];
 
+    for (const btn of allBtns) {
       try {
-        await loginBtn.waitFor({ state: 'visible', timeout: 10_000 });
-        await Promise.all([
-          page.waitForURL(url => !url.toString().includes('/auth/login'), { timeout: 20_000 }),
-          loginBtn.click({ timeout: 10_000 })
-        ]);
-        navigatedAway = true;
-        log('步骤4', '✅ 按钮点击提交成功，页面已跳转');
-      } catch (e) {
-        log('步骤4', `按钮点击也未跳转: ${e.message}`);
-      }
+        const cnt = await btn.count({ timeout: 2000 }).catch(() => 0);
+        if (cnt > 0) {
+          const isDisabled = await btn.isDisabled().catch(() => true);
+          if (!isDisabled) {
+            log('步骤5', `找到可点击按钮，开始点击...`);
+            await Promise.all([
+              page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 }).catch(() => {}),
+              btn.click({ timeout: 5000 })
+            ]);
+            loginClicked = true;
+            break;
+          }
+        }
+      } catch { /* 尝试下一个 */ }
     }
 
-    // 方法3：直接用 JS 提交表单
-    if (!navigatedAway) {
-      log('步骤4', '方法3: 尝试通过 JS 直接提交表单...');
+    // 如果 still 按钮被 disabled，尝试 JS 强制启用并提交
+    if (!loginClicked) {
+      log('步骤5', '所有按钮仍 disabled，尝试 JS 强制提交...');
       try {
-        await page.evaluate(() => {
+        const result = await page.evaluate(() => {
+          // 先强制启用按钮
+          const btn = document.querySelector('button[type="submit"]');
+          if (btn) btn.disabled = false;
+
+          // 尝试触发 Turnstile callback
+          if (typeof window.turnstile !== 'undefined' && window.___turnstileCallbacks) {
+            // 有些站点会在 Turnstile 成功时调用 callback 来启用按钮
+          }
+
+          // 直接提交表单
           const form = document.querySelector('form');
           if (form) {
-            // 尝试绕过 Turnstile 直接触发 submit
-            form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+            form.submit();
+            return 'form-submitted';
           }
+          return 'no-form';
         });
-        await delay(5000, 8000);
-        const url = page.url();
-        if (!url.includes('/auth/login')) {
-          navigatedAway = true;
-          log('步骤4', '✅ JS 表单提交成功');
-        }
+        log('步骤5', `JS 提交结果: ${result}`);
       } catch (e) {
-        log('步骤4', `JS 提交失败: ${e.message}`);
+        log('步骤5', `JS 提交失败: ${e.message}`);
       }
     }
 
-    // 等待最终状态稳定
-    if (!navigatedAway) {
-      await delay(5000, 8000);
-    }
+    await delay(5000, 8000);
 
-    // 检查登录 API 响应
-    if (loginResponses.length > 0) {
-      const lastResp = loginResponses[loginResponses.length - 1];
-      log('步骤4', `登录 API 响应: ${lastResp.status} ${lastResp.url}`);
-    }
-
-    // ═══ 步骤 5：验证登录结果 ═══
+    // ═══ 步骤 6：验证登录结果 ═══
     const url = page.url();
     const pageTitle = await page.title().catch(() => 'unknown');
-    log('步骤5', `最终 URL: ${url}`);
-    log('步骤5', `页面标题: ${pageTitle}`);
+    log('步骤6', `URL: ${url}, 标题: ${pageTitle}`);
 
-    const spAfter = screenshot('03-after-submit');
-    try { await page.screenshot({ path: spAfter, fullPage: true }); } catch (e) { log('截图失败', e.message); }
+    const spAfter = screenshot('03-after-login');
+    try { await page.screenshot({ path: spAfter, fullPage: true }); } catch { /* ignore */ }
 
     const isOnLoginPage = /\/auth\/login/i.test(url);
+    const successPatterns = [/\/dashboard/i, /\/server/i, /\/servers/i, /\/home/i, /\/admin/i, /\/console/i, /\/panel/i, /\/account/i, /\/overview/i];
+    const urlSuccess = successPatterns.some(p => p.test(url));
 
-    // 宽泛的成功 URL 模式
-    const successUrlPatterns = [
-      /\/dashboard/i, /\/server/i, /\/servers/i, /\/home/i,
-      /\/admin/i, /\/console/i, /\/panel/i, /\/account/i, /\/overview/i,
+    const textSelectors = [
+      'text=/Dashboard/i', 'text=/Logout/i', 'text=/Sign out/i', 'text=/Log Out/i',
+      'text=/控制台/i', 'text=/面板/i', 'text=/Servers/i', 'text=/server/i',
+      'text=/Overview/i', 'text=/Welcome/i', 'text=/Account/i',
     ];
-    const urlIndicatesSuccess = successUrlPatterns.some(p => p.test(url));
-
-    // 宽泛的成功文字
-    const successTextSelectors = [
-      'text=/Dashboard/i', 'text=/Logout/i', 'text=/Sign out/i',
-      'text=/控制台/i', 'text=/面板/i', 'text=/Servers/i',
-      'text=/server/i', 'text=/Overview/i', 'text=/Welcome/i',
-      'text=/Account/i', 'text=/Log Out/i', 'text=/logout/i',
-      'text=/admin/i',
-    ];
-
-    let successCount = 0;
-    const matchedText = [];
-    for (const sel of successTextSelectors) {
+    let matchCount = 0;
+    for (const sel of textSelectors) {
       try {
-        const count = await page.locator(sel).first().count({ timeout: 2000 });
-        if (count > 0) { successCount++; matchedText.push(sel); }
+        if (await page.locator(sel).first().count({ timeout: 2000 }) > 0) matchCount++;
       } catch { /* ignore */ }
     }
 
-    // 检查是否有成功的 API 响应
-    const hasSuccessApi = loginResponses.some(r => r.ok && r.status >= 200 && r.status < 400);
-
-    log('步骤5', `匹配成功标识: ${successCount} → ${matchedText.join(', ') || '无'}`);
-    log('步骤5', `URL判断成功: ${urlIndicatesSuccess}, API成功: ${hasSuccessApi}, 离开登录页: ${navigatedAway}`);
-
-    // 宽松判定：三者满足任意一个
-    const loginSuccess = urlIndicatesSuccess || (!isOnLoginPage && navigatedAway) || successCount >= 1 || (hasSuccessApi && !isOnLoginPage);
+    const loginSuccess = urlSuccess || !isOnLoginPage || matchCount >= 1;
 
     if (!loginSuccess) {
       let bodyText = '';
-      try {
-        bodyText = (await page.locator('body').innerText({ timeout: 3000 }).catch(() => '')).substring(0, 500);
-      } catch { /* ignore */ }
-
-      log('步骤5', `❌ 登录失败，页面片段: ${bodyText}`);
-
+      try { bodyText = (await page.locator('body').innerText({ timeout: 3000 }).catch(() => '')).substring(0, 400); } catch { /* ignore */ }
+      log('步骤6', `❌ 登录失败，页面片段: ${bodyText}`);
       await notifyTelegram({
-        ok: false,
-        stage: '登录失败',
-        msg: `未匹配成功标识。URL: ${url}，API响应: ${loginResponses.length ? loginResponses[loginResponses.length - 1].status : '无'}`,
+        ok: false, stage: '登录失败',
+        msg: `URL: ${url}，仍在登录页: ${isOnLoginPage}`,
         screenshotPath: spAfter
       });
       process.exitCode = 1;
       return;
     }
 
-    log('步骤5', `✅ 登录成功！URL: ${url}`);
-    await notifyTelegram({
-      ok: true, stage: '登录成功', msg: `URL: ${url}`, screenshotPath: spAfter
-    });
+    log('步骤6', `✅ 登录成功！URL: ${url}`);
+    await notifyTelegram({ ok: true, stage: '登录成功', msg: `URL: ${url}`, screenshotPath: spAfter });
 
-    // ═══ 步骤 6-9：后续服务器操作 ═══
-    log('步骤6', '正在进入服务器详情页...');
-    const serverLink = page.locator('a[href="/server/5202fe13"]');
+    // ═══ 后续操作 ═══
+    log('步骤7', '进入服务器详情页...');
     try {
+      const serverLink = page.locator('a[href="/server/5202fe13"]');
       await serverLink.waitFor({ state: 'visible', timeout: 20_000 });
       await delay(500, 1000);
       await serverLink.click({ timeout: 10_000 });
+      await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
+      await delay(1000, 2000);
+
+      const spServer = screenshot('04-server-page');
+      try { await page.screenshot({ path: spServer, fullPage: true }); } catch { /* ignore */ }
+      await notifyTelegram({ ok: true, stage: '服务器页面', msg: '已打开', screenshotPath: spServer });
     } catch {
-      log('步骤6', '⚠️ 未找到服务器链接，跳过');
+      log('步骤7', '⚠️ 未找到服务器链接，流程结束');
       process.exitCode = 0;
       return;
     }
 
-    await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
-    await delay(1000, 2000);
-
-    const spServer = screenshot('04-server-page');
-    try { await page.screenshot({ path: spServer, fullPage: true }); } catch { /* ignore */ }
-    await notifyTelegram({ ok: true, stage: '进入服务器页面', msg: '已打开服务器详情', screenshotPath: spServer });
-
-    // Console 菜单
-    log('步骤7', '点击 Console 菜单...');
+    // Console
+    log('步骤8', 'Console...');
     try {
-      const consoleMenu = page.locator('a[href="/server/5202fe13"].active, button:has-text("Console"), a:has-text("Console")').first();
-      await consoleMenu.waitFor({ state: 'visible', timeout: 15_000 });
-      await delay(300, 700);
-      await consoleMenu.click({ timeout: 5_000 });
-      await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
-    } catch {
-      log('步骤7', '⚠️ 无法找到 Console 入口');
-    }
-
+      const consoleMenu = page.locator('button:has-text("Console"), a:has-text("Console")').first();
+      if (await consoleMenu.count({ timeout: 5000 }) > 0) {
+        await consoleMenu.click();
+        await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
+      }
+    } catch { log('步骤8', '⚠️ Console 未找到'); }
     await delay(1500, 3000);
 
     // Restart
-    log('步骤8', '点击 Restart 按钮...');
+    log('步骤9', 'Restart...');
     try {
       const restartBtn = page.locator('button:has-text("Restart")');
-      await restartBtn.waitFor({ state: 'visible', timeout: 15_000 });
-      await delay(500, 1000);
+      await restartBtn.waitFor({ state: 'visible', timeout: 15000 });
       await restartBtn.click();
-      await notifyTelegram({ ok: true, stage: '点击 Restart', msg: 'VPS 正在重启' });
-    } catch {
-      log('步骤8', '⚠️ 未找到 Restart 按钮');
-    }
+      await notifyTelegram({ ok: true, stage: 'Restart', msg: 'VPS 重启中' });
+    } catch { log('步骤9', '⚠️ Restart 未找到'); }
 
     await delay(8000, 12000);
 
     // 命令
-    log('步骤9', '在 Console 中输入命令...');
+    log('步骤10', '输入命令...');
     try {
-      const commandInput = page.locator('input[placeholder="Type a command..."]');
-      await commandInput.waitFor({ state: 'visible', timeout: 20_000 });
-      await delay(200, 500);
-      await commandInput.fill('working properly');
-      await delay(300, 700);
-      await commandInput.press('Enter');
-    } catch {
-      log('步骤9', '⚠️ 未找到命令行输入框');
-    }
+      const cmdInput = page.locator('input[placeholder="Type a command..."]');
+      await cmdInput.waitFor({ state: 'visible', timeout: 20_000 });
+      await cmdInput.fill('working properly');
+      await cmdInput.press('Enter');
+    } catch { log('步骤10', '⚠️ 命令行未找到'); }
 
     await delay(4000, 6000);
+    const spCmd = screenshot('05-done');
+    try { await page.screenshot({ path: spCmd, fullPage: true }); } catch { /* ignore */ }
+    await notifyTelegram({ ok: true, stage: '完成', msg: '流程结束', screenshotPath: spCmd });
 
-    const spCommand = screenshot('05-command-executed');
-    try { await page.screenshot({ path: spCommand, fullPage: true }); } catch { /* ignore */ }
-    await notifyTelegram({ ok: true, stage: '命令执行完成', msg: '流程已完成', screenshotPath: spCommand });
-
-    log('完成', '🎉 所有操作已完成');
+    log('完成', '🎉');
     process.exitCode = 0;
 
   } catch (e) {
     log('异常', e?.message || String(e));
     const sp = screenshot('99-error');
     try { await page.screenshot({ path: sp, fullPage: true }); } catch { /* ignore */ }
-    await notifyTelegram({
-      ok: false, stage: '异常',
-      msg: e?.message || String(e),
-      screenshotPath: fs.existsSync(sp) ? sp : undefined
-    });
+    await notifyTelegram({ ok: false, stage: '异常', msg: e?.message || String(e), screenshotPath: fs.existsSync(sp) ? sp : undefined });
     process.exitCode = 1;
   } finally {
     await context.close();
