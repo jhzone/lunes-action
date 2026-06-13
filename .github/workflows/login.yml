@@ -12,26 +12,14 @@ jobs:
     timeout-minutes: 15
 
     env:
-      LUNES_USERNAME: ${{ secrets.LUNES_USERNAME }}
-      LUNES_PASSWORD: ${{ secrets.LUNES_PASSWORD }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      LUNES_USERNAME: ${{ secrets.LUNES_USERNAME || vars.LUNES_USERNAME }}
+      LUNES_PASSWORD: ${{ secrets.LUNES_PASSWORD || vars.LUNES_PASSWORD }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || vars.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || vars.TELEGRAM_CHAT_ID }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Validate secrets
-        run: |
-          if [ -z "${{ secrets.LUNES_USERNAME }}" ]; then
-            echo "::error::❌ GitHub Secret 'LUNES_USERNAME' 未设置或为空！请在仓库 Settings → Secrets and variables → Actions 中添加。"
-            exit 1
-          fi
-          if [ -z "${{ secrets.LUNES_PASSWORD }}" ]; then
-            echo "::error::❌ GitHub Secret 'LUNES_PASSWORD' 未设置或为空！请在仓库 Settings → Secrets and variables → Actions 中添加。"
-            exit 1
-          fi
-          echo "✅ 所有必需的 Secret 已配置"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
